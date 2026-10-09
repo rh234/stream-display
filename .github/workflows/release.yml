@@ -1,0 +1,96 @@
+﻿name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: version
+        required: true
+        default: v1.0.0
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    env:
+      STREAM_DISPLAY_NO_PAUSE: '1'
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      VENCORD_COMMIT: 718c867256a9d181edc7a534afb296b9bb41ab58
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: check version
+        run: |
+          if ( $env:RELEASE_VERSION -notmatch '^v\d+\.\d+\.\d+$' ) { throw 'use a version like v1.0.0' }
+          gh release view $env:RELEASE_VERSION --repo $env:GITHUB_REPOSITORY *> $null
+          if ( $LASTEXITCODE -eq 0 ) { throw 'that release already exists. use a new version' }
+          $global:LASTEXITCODE = 0
+
+      - name: get vencord
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Path '.build' -Force | Out-Null
+          Invoke-WebRequest "https://github.com/Vendicated/Vencord/archive/$env:VENCORD_COMMIT.zip" -OutFile '.build/upstream.zip' -UseBasicParsing
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::ExtractToDirectory( ( Join-Path $pwd '.build/upstream.zip' ), ( Join-Path $pwd '.build' ) )
+          Move-Item -LiteralPath ".build/Vencord-$env:VENCORD_COMMIT" -Destination '.build/Vencord-main'
+
+      - name: build
+        shell: cmd
+        run: call build.cmd
+
+      - name: package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $output = Join-Path $pwd '.build/release'
+          $package = Join-Path $output 'installer'
+          New-Item -ItemType Directory -Path "$package/dist" -Force | Out-Null
+          Copy-Item -Path 'dist/*' -Destination "$package/dist"
+          Copy-Item -LiteralPath 'install.cmd' -Destination "$package/Install.cmd"
+          Copy-Item -LiteralPath '.build/Vencord-main/LICENSE' -Destination "$package/LICENSE"
+          $manifest = Get-ChildItem "$package/dist" -File | ForEach-Object {
+              [pscustomobject]@{ Name = $_.Name; Hash = ( Get-FileHash $_.FullName -Algorithm SHA256 ).Hash }
+          }
+          $manifest | ConvertTo-Json | Set-Content "$package/checksums.json" -Encoding UTF8
+          "source: https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_VERSION/Vencord-source.zip" | Set-Content "$package/SOURCE.txt" -Encoding UTF8
+          "install vencord first, close discord, extract this zip and run Install.cmd`nright click a stream -> stream display -> stretch`noriginal turns it off`nbacks up and replaces your vencord build. it will not be auto updated" | Set-Content "$package/READ ME.txt" -Encoding UTF8
+          Compress-Archive -Path "$package/*" -DestinationPath "$output/Stream-display-easy-install.zip"
+          $upstream = [IO.Compression.ZipFile]::OpenRead( ( Join-Path $pwd '.build/upstream.zip' ) )
+          $source = [IO.Compression.ZipFile]::Open( "$output/Vencord-source.zip", [IO.Compression.ZipArchiveMode]::Create )
+          try {
+              foreach ( $entry in $upstream.Entries ) {
+                  $relative = $entry.FullName.Substring( $entry.FullName.IndexOf( '/' ) + 1 )
+                  if ( -not $relative ) { continue }
+                  $copy = $source.CreateEntry( 'Vencord-main/' + $relative )
+                  if ( $entry.FullName.EndsWith( '/' ) ) { continue }
+                  $inputStream = $entry.Open()
+                  $outputStream = $copy.Open()
+                  try { $inputStream.CopyTo( $outputStream ) } finally { $inputStream.Dispose(); $outputStream.Dispose() }
+              }
+              [IO.Compression.ZipFileExtensions]::CreateEntryFromFile( $source, ( Join-Path $pwd 'index.tsx' ), 'Vencord-main/src/userplugins/forceStreamAspectRatio/index.tsx' ) | Out-Null
+              $instructions = $source.CreateEntry( 'Vencord-main/BUILD.txt' )
+              $writer = [IO.StreamWriter]::new( $instructions.Open() )
+              try {
+                  $writer.WriteLine( "node.js 22+`ncorepack pnpm install --frozen-lockfile`n`$env:VENCORD_HASH = 'stream-display'`n`$env:VENCORD_REMOTE = 'Vendicated/Vencord'`nnode scripts/build/build.mjs --standalone --disable-updater" )
+              } finally { $writer.Dispose() }
+          } finally { $upstream.Dispose(); $source.Dispose() }
+          "stretch incoming discord screenshares`n`ninstall vencord first, close discord, extract Stream-display-easy-install.zip and run Install.cmd`n`nright click a stream -> stream display -> stretch" | Set-Content "$output/notes.txt" -Encoding UTF8
+
+      - name: publish
+        run: |
+          $output = '.build/release'
+          gh release create $env:RELEASE_VERSION "$output/Stream-display-easy-install.zip" "$output/Vencord-source.zip" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "stream-display $env:RELEASE_VERSION" --notes-file "$output/notes.txt" --latest
+          if ( $LASTEXITCODE -ne 0 ) { throw 'release failed' }
