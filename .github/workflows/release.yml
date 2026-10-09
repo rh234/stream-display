@@ -1,4 +1,4 @@
-﻿name: release
+name: release
 
 on:
   workflow_dispatch:
@@ -34,9 +34,9 @@ jobs:
       - name: check version
         run: |
           if ( $env:RELEASE_VERSION -notmatch '^v\d+\.\d+\.\d+$' ) { throw 'use a version like v1.0.0' }
-          gh release view $env:RELEASE_VERSION --repo $env:GITHUB_REPOSITORY *> $null
-          if ( $LASTEXITCODE -eq 0 ) { throw 'that release already exists. use a new version' }
-          $global:LASTEXITCODE = 0
+          $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName | ConvertFrom-Json
+          if ( $LASTEXITCODE -ne 0 ) { throw 'couldnt check existing releases' }
+          if ( $env:RELEASE_VERSION -in $releases.tagName ) { throw 'that release already exists. use a new version' }
 
       - name: get vencord
         run: |
